@@ -16,7 +16,7 @@ def plot_classification_report(y_true, y_pred, labels=["CORAL", "CORAL_BL"]):
     df = pd.DataFrame(report_dict).transpose()
     plt.figure(figsize=(8, len(df)*0.6+1))
     plt.title('Classification Report')
-    sns.heatmap(df.iloc[:-1, :-1], annot=True, fmt='.2f', cmap='YlGnBu', cbar=False)
+    sns.heatmap(df.iloc[:-1, :-1], annot=True, fmt='.2f', cmap='Blues', cbar=False)
     plt.yticks(rotation=0)
     plt.show()
 
