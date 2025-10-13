@@ -1,0 +1,76 @@
+import numpy as np
+
+def compute_metrics_per_class(gt_mask, pred_mask, class_id):
+    """
+    Computes pixel-level metrics for a given class_id.
+    class_id = 0 → non-bleached
+    class_id = 1 → bleached
+    """
+    gt = (gt_mask == class_id).astype(np.uint8)
+    pred = (pred_mask == class_id).astype(np.uint8)
+    
+    tp = np.logical_and(pred == 1, gt == 1).sum()
+    fp = np.logical_and(pred == 1, gt == 0).sum()
+    fn = np.logical_and(pred == 0, gt == 1).sum()
+    tn = np.logical_and(pred == 0, gt == 0).sum()
+
+    eps = 1e-8  # avoid division by zero
+
+    # Core metrics
+    iou = tp / (tp + fp + fn + eps)
+    precision = tp / (tp + fp + eps)
+    recall = tp / (tp + fn + eps)
+    f1 = 2 * precision * recall / (precision + recall + eps)
+    dice = (2 * tp) / (2 * tp + fp + fn + eps)
+
+    # Accuracy metrics
+    pixel_accuracy = (tp + tn) / (tp + tn + fp + fn + eps)
+    class_accuracy = tp / (tp + fn + eps)
+
+    return {
+        'IoU': iou,
+        'Precision': precision,
+        'Recall': recall,
+        'F1-Score': f1,
+        'Dice': dice,
+        'Pixel Accuracy': pixel_accuracy,
+        'Class Accuracy': class_accuracy
+    }
+
+
+def evaluate_image(gt_mask, pred_mask, num_classes=2):
+    """
+    Computes metrics for each class and averages them for a single image.
+    """
+    results = {}
+    class_metrics = []
+
+    for class_id in range(num_classes):
+        metrics = compute_metrics_per_class(gt_mask, pred_mask, class_id)
+        class_metrics.append(metrics)
+        results[f'class_{class_id}'] = metrics
+
+    # Compute mean across classes (macro average)
+    mean_metrics = {metric: np.mean([m[metric] for m in class_metrics]) for metric in class_metrics[0].keys()}
+    results['mean'] = mean_metrics
+
+    return results
+
+
+def evaluate_dataset(gt_list, pred_list, num_classes=2):
+    """
+    Aggregates results across a full test dataset.
+    gt_list and pred_list are lists of masks (same length).
+    """
+    assert len(gt_list) == len(pred_list), "GT and prediction list lengths must match"
+
+    dataset_metrics = {key: [] for key in ['IoU', 'Precision', 'Recall', 'F1-Score', 'Dice', 'Pixel Accuracy', 'Class Accuracy']}
+
+    for gt_mask, pred_mask in zip(gt_list, pred_list):
+        image_metrics = evaluate_image(gt_mask, pred_mask, num_classes)['mean']
+        for key, value in image_metrics.items():
+            dataset_metrics[key].append(value)
+
+    # Compute overall dataset averages
+    dataset_summary = {metric: np.mean(values) for metric, values in dataset_metrics.items()}
+    return dataset_summary
