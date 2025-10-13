@@ -1,0 +1,591 @@
+"""
+Pixel-level evaluation for coral bleaching segmentation (bleached vs non-bleached).
+
+Features
+- Per-image pixel counts and metrics (precision, recall, IoU) computed separately for:
+    bleached (class 0) and non_bleached (class 1). Pixel accuracy is also reported across all pixels.
+- Supports GT from YOLO polygon labels or from binary mask images
+- Supports predictions from YOLO polygon label files (Ultralytics predict --save_txt)
+- Resolves overlaps by giving priority: bleached > non_bleached (optional)
+- Writes a CSV summary (per image) and prints aggregates
+
+Usage examples (PowerShell):
+
+1) Pred from YOLO txt labels; GT from dataset YOLO labels
+    python scripts/eval_bleach_pixel_performance.py \
+      --images C:/path/to/images/val \
+      --pred-labels C:/path/to/predictions/labels \
+      --gt-labels   C:/path/to/dataset/labels/val \
+      --out-csv C:/path/to/out/pixel_eval.csv
+
+2) Pred from YOLO txt labels; GT from mask images (two folders)
+    python scripts/eval_bleach_pixel_performance.py \
+      --images C:/path/to/images/val \
+      --pred-labels C:/path/to/predictions/labels \
+      --gt-bleached C:/path/to/masks_bleached \
+      --gt-nonbleached C:/path/to/masks_non_bleached \
+      --gt-suffix-bleached _bleached --gt-suffix-non _non_bleached \
+      --out-csv C:/path/to/out/pixel_eval.csv
+
+Notes
+- If both sources for GT are provided, YOLO labels take precedence.
+- Any missing prediction or GT for an image is treated as empty for that side.
+
+Defaults (runs without arguments)
+- images:      <repo>/dataset/images/val
+- gt-labels:   <repo>/dataset/labels/val (preferred if exists)
+- pred-labels: auto-detected: <repo>/runs/segment/predict*/labels (most recent)
+- out-csv:     <repo>/runs/pixel_eval_val.csv
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple, Set
+import sys
+
+import cv2
+import numpy as np
+from tqdm import tqdm
+
+
+# Class mapping (YOLO labels): 0=bleached, 1=non_bleached
+CLASS_NAMES = ["bleached", "non_bleached"]
+CLS_BLEACHED = 0
+CLS_NON = 1
+
+# Values used for pixel-accuracy visualization map
+LABEL_BACKGROUND = 0
+LABEL_BLEACHED = 1
+LABEL_NON = 2
+
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
+MASK_EXTS = IMAGE_EXTS
+
+
+def load_image(path: Path) -> Optional[np.ndarray]:
+    img = cv2.imread(str(path), cv2.IMREAD_COLOR)
+    return img
+
+
+def load_mask_any(path: Optional[Path]) -> Optional[np.ndarray]:
+    if not path:
+        return None
+    if not path.exists():
+        return None
+    img = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+    if img is None:
+        return None
+    if img.ndim == 2:
+        return img
+    if img.ndim == 3:
+        if img.shape[2] == 4:
+            return img[:, :, 3]
+        return cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    return None
+
+
+def find_mask_by_suffix(msk_dir: Path, stem: str, suffix: str) -> Optional[Path]:
+    # Exact matches first
+    for ext in MASK_EXTS:
+        cand = msk_dir / f"{stem}{suffix}{ext}"
+        if cand.exists():
+            return cand
+    # Fallback: any file starting with stem+suffix
+    cands = sorted(msk_dir.glob(f"{stem}{suffix}*"))
+    for c in cands:
+        if c.is_file() and c.suffix.lower() in MASK_EXTS:
+            return c
+    return None
+
+
+def yolo_seg_txt_to_class_masks(
+    label_path: Path,
+    H: int,
+    W: int,
+    num_classes: int = 2,
+    overlap_priority: Tuple[int, ...] = (CLS_BLEACHED, CLS_NON),
+) -> Dict[int, np.ndarray]:
+    """
+    Parse a YOLO segmentation label file into per-class binary masks.
+    - label format per line: cls_id x1 y1 x2 y2 ... xn yn (normalized coords [0,1])
+    - Returns a dict: class_id -> (H,W) uint8 mask {0,1}
+    - Overlaps are resolved by class priority order if provided.
+    """
+    masks: Dict[int, List[np.ndarray]] = {}
+
+    if not label_path.exists():
+        # return empty masks
+        return {c: np.zeros((H, W), dtype=np.uint8) for c in range(num_classes)}
+
+    lines = Path(label_path).read_text(encoding="utf-8").strip().splitlines()
+    for ln in lines:
+        ln = ln.strip()
+        if not ln:
+            continue
+        parts = ln.split()
+        try:
+            cls_id = int(float(parts[0]))
+        except Exception:
+            continue
+        if cls_id < 0 or cls_id >= num_classes:
+            continue
+        coords = parts[1:]
+        if len(coords) < 6 or len(coords) % 2 == 1:
+            # invalid polygon
+            continue
+        arr = np.array([float(x) for x in coords], dtype=np.float32)
+        pts = arr.reshape(-1, 2)
+        # denormalize
+        pts[:, 0] = np.clip(pts[:, 0] * W, 0, W - 1)
+        pts[:, 1] = np.clip(pts[:, 1] * H, 0, H - 1)
+        pts_i = np.round(pts).astype(np.int32)
+        masks.setdefault(cls_id, []).append(pts_i)
+
+    # Rasterize class masks (no background key here)
+    out: Dict[int, np.ndarray] = {c: np.zeros((H, W), dtype=np.uint8) for c in range(num_classes)}
+    for c, polys in masks.items():
+        if not polys:
+            continue
+        cv2.fillPoly(out[c], polys, color=1)
+
+    # Resolve overlaps: apply priority for foreground classes
+    taken = np.zeros((H, W), dtype=np.uint8)
+    for c in overlap_priority:
+        m = out.get(c, None)
+        if m is None:
+            continue
+        assign = (m == 1) & (taken == 0)
+        out[c] = np.where(assign, 1, 0).astype(np.uint8)
+        taken |= out[c]
+
+    return out
+
+
+def gt_masks_from_images(
+    H: int,
+    W: int,
+    img_stem: str,
+    bleached_dir: Optional[Path],
+    non_dir: Optional[Path],
+    suffix_bleached: str,
+    suffix_non: str,
+    thresh: int,
+    invert: bool,
+    resolve_overlap: bool,
+) -> Dict[int, np.ndarray]:
+    """Load GT masks from two folders (bleached/non_bleached) and build class maps."""
+    m_b = None
+    m_nb = None
+    if bleached_dir:
+        p_b = find_mask_by_suffix(bleached_dir, img_stem, suffix_bleached)
+        if p_b:
+            m_b = load_mask_any(p_b)
+    if non_dir:
+        p_nb = find_mask_by_suffix(non_dir, img_stem, suffix_non)
+        if p_nb:
+            m_nb = load_mask_any(p_nb)
+
+    def prep(m: Optional[np.ndarray]) -> Optional[np.ndarray]:
+        if m is None:
+            return None
+        if m.shape[:2] != (H, W):
+            m = cv2.resize(m, (W, H), interpolation=cv2.INTER_NEAREST)
+        m = (m > thresh).astype(np.uint8)
+        if invert:
+            m = 1 - m
+        return m
+
+    m_b = prep(m_b)
+    m_nb = prep(m_nb)
+
+    if resolve_overlap and (m_b is not None) and (m_nb is not None):
+        m_nb = (m_nb & (1 - m_b)).astype(np.uint8)
+
+    out = {
+        CLS_BLEACHED: np.zeros((H, W), dtype=np.uint8),
+        CLS_NON: np.zeros((H, W), dtype=np.uint8),
+    }
+    if m_b is not None:
+        out[CLS_BLEACHED] = (m_b > 0).astype(np.uint8)
+    if m_nb is not None:
+        out[CLS_NON] = (m_nb > 0).astype(np.uint8)
+
+    # Priority: bleached > non
+    taken = out[CLS_BLEACHED].copy()
+    out[CLS_NON] = np.where((out[CLS_NON] == 1) & (taken == 0), 1, 0).astype(np.uint8)
+    return out
+
+
+@dataclass
+class ImageMetrics:
+    image: str
+    H: int
+    W: int
+    gt_px_bleached: int
+    pred_px_bleached: int
+    tp_bleached: int
+    fp_bleached: int
+    fn_bleached: int
+    iou_bleached: float
+    precision_bleached: float
+    recall_bleached: float
+    pixel_accuracy_bleached: float
+    gt_px_non: int
+    pred_px_non: int
+    tp_non: int
+    fp_non: int
+    fn_non: int
+    iou_non: float
+    precision_non: float
+    recall_non: float
+    pixel_accuracy_non: float
+    pixel_accuracy_all: float
+
+
+def compute_metrics_per_class(gt: np.ndarray, pred: np.ndarray) -> Tuple[int, int, int, int, int, float, float, float]:
+    # gt, pred are binary uint8 masks {0,1}
+    gt_px = int(gt.sum())
+    pred_px = int(pred.sum())
+    tp = int((gt & pred).sum())
+    fp = int(((1 - gt) & pred).sum())
+    fn = int((gt & (1 - pred)).sum())
+    denom_iou = tp + fp + fn
+    iou = tp / denom_iou if denom_iou > 0 else 1.0 if gt_px == 0 and pred_px == 0 else 0.0
+    prec = tp / (tp + fp) if (tp + fp) > 0 else 1.0 if pred_px == 0 and gt_px == 0 else 0.0
+    rec = tp / (tp + fn) if (tp + fn) > 0 else 1.0 if gt_px == 0 and pred_px == 0 else 0.0
+    return gt_px, pred_px, tp, fp, fn, iou, prec, rec
+
+
+def class_maps_from_sources(
+    img_path: Path,
+    pred_labels_dir: Optional[Path],
+    gt_labels_dir: Optional[Path],
+    gt_bleached_dir: Optional[Path],
+    gt_non_dir: Optional[Path],
+    gt_suffix_bleached: str,
+    gt_suffix_non: str,
+    gt_thresh: int,
+    gt_invert: bool,
+    resolve_overlap: bool,
+) -> Tuple[int, int, Dict[int, np.ndarray], Dict[int, np.ndarray]]:
+    img = load_image(img_path)
+    if img is None:
+        raise FileNotFoundError(f"Cannot read image: {img_path}")
+    H, W = img.shape[:2]
+    stem = img_path.stem
+
+    # Prediction masks
+    pred_masks = {c: np.zeros((H, W), dtype=np.uint8) for c in range(2)}
+    if pred_labels_dir:
+        pred_label_path = pred_labels_dir / f"{stem}.txt"
+        pred_masks = yolo_seg_txt_to_class_masks(pred_label_path, H, W)
+
+    # GT masks
+    if gt_labels_dir:
+        gt_label_path = gt_labels_dir / f"{stem}.txt"
+        gt_masks = yolo_seg_txt_to_class_masks(gt_label_path, H, W)
+    else:
+        gt_masks = gt_masks_from_images(
+            H,
+            W,
+            stem,
+            gt_bleached_dir,
+            gt_non_dir,
+            gt_suffix_bleached,
+            gt_suffix_non,
+            gt_thresh,
+            gt_invert,
+            resolve_overlap,
+        )
+
+    return H, W, gt_masks, pred_masks
+
+
+def evaluate(
+    images_dir: Path,
+    pred_labels_dir: Optional[Path],
+    gt_labels_dir: Optional[Path],
+    gt_bleached_dir: Optional[Path],
+    gt_non_dir: Optional[Path],
+    gt_suffix_bleached: str,
+    gt_suffix_non: str,
+    gt_thresh: int,
+    gt_invert: bool,
+    resolve_overlap: bool,
+    out_csv: Optional[Path],
+    include_stems: Optional[Set[str]] = None,
+):
+    # Gather images
+    imgs = [p for p in images_dir.iterdir() if p.suffix.lower() in IMAGE_EXTS]
+    if include_stems:
+        include_stems = {s.strip() for s in include_stems if s and s.strip()}
+        imgs = [p for p in imgs if p.stem in include_stems or p.name in include_stems]
+    if not imgs:
+        raise FileNotFoundError(f"No images found in {images_dir}")
+
+    metrics: List[ImageMetrics] = []
+    for img_path in tqdm(imgs, desc="Evaluating images"):
+        try:
+            H, W, gt_masks, pred_masks = class_maps_from_sources(
+                img_path,
+                pred_labels_dir,
+                gt_labels_dir,
+                gt_bleached_dir,
+                gt_non_dir,
+                gt_suffix_bleached,
+                gt_suffix_non,
+                gt_thresh,
+                gt_invert,
+                resolve_overlap,
+            )
+        except Exception as e:
+            print(f"[WARN] {img_path.name}: {e}")
+            continue
+
+        # Build class id maps (0=background, 1=bleached, 2=non)
+        gt_class = np.full((H, W), LABEL_BACKGROUND, dtype=np.uint8)
+        pred_class = np.full((H, W), LABEL_BACKGROUND, dtype=np.uint8)
+
+        # priority: bleached > non
+        if gt_masks[CLS_NON].any():
+            gt_class[gt_masks[CLS_NON] == 1] = LABEL_NON
+        if gt_masks[CLS_BLEACHED].any():
+            gt_class[gt_masks[CLS_BLEACHED] == 1] = LABEL_BLEACHED
+
+        if pred_masks[CLS_NON].any():
+            pred_class[pred_masks[CLS_NON] == 1] = LABEL_NON
+        if pred_masks[CLS_BLEACHED].any():
+            pred_class[pred_masks[CLS_BLEACHED] == 1] = LABEL_BLEACHED
+
+        # Metrics per class (as binary masks)
+        b_stats = compute_metrics_per_class(gt_masks[CLS_BLEACHED], pred_masks[CLS_BLEACHED])
+        nb_stats = compute_metrics_per_class(gt_masks[CLS_NON], pred_masks[CLS_NON])
+
+        # Per-class pixel accuracy (binary accuracy for class vs not-class)
+        tn_b = int(((1 - gt_masks[CLS_BLEACHED]) & (1 - pred_masks[CLS_BLEACHED])).sum())
+        tn_nb = int(((1 - gt_masks[CLS_NON]) & (1 - pred_masks[CLS_NON])).sum())
+        total_px = H * W
+        acc_b = (b_stats[2] + tn_b) / total_px if total_px > 0 else 0.0
+        acc_nb = (nb_stats[2] + tn_nb) / total_px if total_px > 0 else 0.0
+
+        # Pixel accuracy over all classes
+        pixel_acc = float((gt_class == pred_class).sum()) / float(H * W)
+
+        m = ImageMetrics(
+            image=img_path.name,
+            H=H,
+            W=W,
+            gt_px_bleached=b_stats[0],
+            pred_px_bleached=b_stats[1],
+            tp_bleached=b_stats[2],
+            fp_bleached=b_stats[3],
+            fn_bleached=b_stats[4],
+            iou_bleached=b_stats[5],
+            precision_bleached=b_stats[6],
+            recall_bleached=b_stats[7],
+            pixel_accuracy_bleached=acc_b,
+            gt_px_non=nb_stats[0],
+            pred_px_non=nb_stats[1],
+            tp_non=nb_stats[2],
+            fp_non=nb_stats[3],
+            fn_non=nb_stats[4],
+            iou_non=nb_stats[5],
+            precision_non=nb_stats[6],
+            recall_non=nb_stats[7],
+            pixel_accuracy_non=acc_nb,
+            pixel_accuracy_all=pixel_acc,
+        )
+        metrics.append(m)
+
+    if not metrics:
+        print("No metrics computed. Check your inputs.")
+        return
+
+    # Aggregate
+    agg = {
+        "count": len(metrics),
+        "mean_iou_bleached": float(np.mean([m.iou_bleached for m in metrics])),
+        "mean_iou_non": float(np.mean([m.iou_non for m in metrics])),
+        "mean_precision_bleached": float(np.mean([m.precision_bleached for m in metrics])),
+        "mean_precision_non": float(np.mean([m.precision_non for m in metrics])),
+        "mean_recall_bleached": float(np.mean([m.recall_bleached for m in metrics])),
+        "mean_recall_non": float(np.mean([m.recall_non for m in metrics])),
+        "mean_pixel_accuracy_bleached": float(np.mean([m.pixel_accuracy_bleached for m in metrics])),
+        "mean_pixel_accuracy_non": float(np.mean([m.pixel_accuracy_non for m in metrics])),
+        "mean_pixel_accuracy": float(np.mean([m.pixel_accuracy_all for m in metrics])),
+    }
+
+    print("\nAggregate summary (per-image mean):")
+    for k, v in agg.items():
+        print(f"  {k}: {v:.6f}" if isinstance(v, float) else f"  {k}: {v}")
+
+    # CSV
+    if out_csv:
+        out_csv.parent.mkdir(parents=True, exist_ok=True)
+        with open(out_csv, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow([
+                "image", "H", "W",
+                "gt_px_bleached", "pred_px_bleached", "tp_bleached", "fp_bleached", "fn_bleached",
+                "iou_bleached", "precision_bleached", "recall_bleached",
+                "pixel_accuracy_bleached",
+                "gt_px_non", "pred_px_non", "tp_non", "fp_non", "fn_non",
+                "iou_non", "precision_non", "recall_non",
+                "pixel_accuracy_non",
+                "pixel_accuracy_all",
+            ])
+            for m in metrics:
+                w.writerow([
+                    m.image, m.H, m.W,
+                    m.gt_px_bleached, m.pred_px_bleached, m.tp_bleached, m.fp_bleached, m.fn_bleached,
+                    f"{m.iou_bleached:.6f}", f"{m.precision_bleached:.6f}", f"{m.recall_bleached:.6f}",
+                    f"{m.pixel_accuracy_bleached:.6f}",
+                    m.gt_px_non, m.pred_px_non, m.tp_non, m.fp_non, m.fn_non,
+                    f"{m.iou_non:.6f}", f"{m.precision_non:.6f}", f"{m.recall_non:.6f}",
+                    f"{m.pixel_accuracy_non:.6f}",
+                    f"{m.pixel_accuracy_all:.6f}",
+                ])
+        print(f"Wrote per-image metrics to {out_csv}")
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Pixel-level evaluation for bleached vs non-bleached")
+    p.add_argument("--images", type=str, help="Directory with images (single split, e.g., images/val)")
+    p.add_argument(
+        "--images-list",
+        type=str,
+        help=(
+            "Optional path to a text file with image stems or filenames to include (one per line). Useful for CV folds."
+        ),
+    )
+    p.add_argument("--pred-labels", type=str, help="Directory with predicted YOLO segmentation .txt labels")
+    # GT sources (choose one)
+    p.add_argument("--gt-labels", type=str, help="Directory with GT YOLO segmentation .txt labels")
+    p.add_argument("--gt-bleached", type=str, help="Directory with GT bleached masks")
+    p.add_argument("--gt-nonbleached", type=str, help="Directory with GT non-bleached masks")
+    p.add_argument("--gt-suffix-bleached", type=str, default="_bleached", help="Suffix for bleached mask filenames")
+    p.add_argument("--gt-suffix-non", type=str, default="_non_bleached", help="Suffix for non-bleached mask filenames")
+    p.add_argument("--gt-thresh", type=int, default=127, help="Threshold for binarizing GT masks")
+    p.add_argument("--gt-invert", action="store_true", help="Invert GT masks after thresholding")
+    p.add_argument("--resolve-overlap", action="store_true", help="Resolve GT mask overlaps (non = non & ~bleached)")
+    p.add_argument(
+        "--prefer-gt-masks",
+        action="store_true",
+        help=(
+            "Use mask folders as GT even if YOLO GT labels exist (requires both --gt-bleached and --gt-nonbleached)."
+        ),
+    )
+    p.add_argument("--out-csv", type=str, help="Path to write per-image CSV metrics")
+    return p.parse_args()
+
+
+# When running with no CLI arguments, these values will be used as defaults.
+# Adjust these to your environment as needed.
+HARDCODE_DEFAULTS = {
+    "images": "coral_bleaching/reef_support/yolo_seg/images/val",
+    # Point to your predicted labels directory (Ultralytics predict --save_txt output)
+    "pred_labels": "yolov12/runs/segment/predict_val_nws/labels",
+    # Choose GT source: either 'gt_labels' (YOLO polygons) OR both 'gt_bleached' and 'gt_nonbleached' (mask folders)
+    "gt_labels": "coral_bleaching/reef_support/yolo_seg/labels/val",
+    "gt_bleached": None,
+    "gt_nonbleached": None,
+    # Mask GT options
+    "gt_suffix_bleached": "_bleached",
+    "gt_suffix_non": "_non_bleached",
+    "gt_thresh": 127,
+    "gt_invert": False,
+    "resolve_overlap": False,
+    # Force using mask GT even if YOLO GT labels exist
+    "prefer_gt_masks": False,
+    # Optional list of image stems/filenames to include (for CV folds)
+    "images_list": None,
+    # Output CSV path
+    "out_csv": "yolov12/runs/pixel_eval_val.csv",
+}
+
+
+def main():
+    args = parse_args()
+
+    # Workspace root: <repo>/ from this scripts/ file
+    repo_root = Path(__file__).resolve().parents[1]
+
+    # Defaults
+    default_images = Path("coral_bleaching/reef_support/yolo_seg/images/val")
+    default_gt_labels = Path("coral_bleaching/reef_support/yolo_seg/labels/val")
+
+    def autodetect_pred_labels(root: Path) -> Optional[Path]:
+        # Pick the most recent runs/segment/predict*/labels if exists
+        candidates = list(root.glob("runs/segment/predict*/labels"))
+        if not candidates:
+            # also try plain runs/segment/predict/labels
+            p = root / "runs" / "segment" / "predict" / "labels"
+            return p if p.exists() else None
+        try:
+            candidates.sort(key=lambda p: p.parent.stat().st_mtime, reverse=True)
+        except Exception:
+            candidates.sort()
+        return candidates[0]
+
+    # If run with no CLI arguments, use the hardcoded defaults
+    if len(sys.argv) == 1:
+        # Fill argparse Namespace from HARDCODE_DEFAULTS
+        for k, v in HARDCODE_DEFAULTS.items():
+            # Only set if attribute exists or is expected later
+            try:
+                setattr(args, k.replace("-", "_"), v)
+            except Exception:
+                pass
+
+    images_dir = Path(args.images) if args.images else default_images
+    include_stems: Optional[Set[str]] = None
+    if args.images_list:
+        list_path = Path(args.images_list)
+        if not list_path.exists():
+            raise FileNotFoundError(f"--images-list not found: {list_path}")
+        lines = list_path.read_text(encoding="utf-8").splitlines()
+        include_stems = {ln.strip() for ln in lines if ln.strip()}
+    # Choose prediction labels directory: prefer explicit/default hardcoded; else autodetect
+    pred_labels_dir = Path(args.pred_labels) if args.pred_labels else autodetect_pred_labels(repo_root)
+    # Choose GT source
+    if args.prefer_gt_masks:
+        # Force using masks for GT regardless of YOLO labels presence
+        gt_labels_dir = None
+    else:
+        gt_labels_dir = Path(args.gt_labels) if args.gt_labels else (default_gt_labels if default_gt_labels.exists() else None)
+    gt_bleached_dir = Path(args.gt_bleached) if args.gt_bleached else None
+    gt_non_dir = Path(args.gt_nonbleached) if args.gt_nonbleached else None
+    out_csv = Path(args.out_csv) if args.out_csv else (repo_root / "runs" / "pixel_eval_val.csv")
+
+    if not images_dir.exists() or not images_dir.is_dir():
+        raise FileNotFoundError(f"Images dir not found: {images_dir}")
+
+    # Prefer GT labels if present (unless --prefer-gt-masks); else require both mask dirs
+    if gt_labels_dir is None or not gt_labels_dir.exists():
+        if gt_bleached_dir is None or gt_non_dir is None:
+            raise ValueError(
+                "Ground truth not specified and defaults not found. Provide --gt-labels or both --gt-bleached and --gt-nonbleached."
+            )
+
+    evaluate(
+        images_dir=images_dir,
+        pred_labels_dir=pred_labels_dir,
+        gt_labels_dir=gt_labels_dir,
+        gt_bleached_dir=gt_bleached_dir,
+        gt_non_dir=gt_non_dir,
+        gt_suffix_bleached=args.gt_suffix_bleached,
+        gt_suffix_non=args.gt_suffix_non,
+        gt_thresh=args.gt_thresh,
+        gt_invert=args.gt_invert,
+        resolve_overlap=bool(args.resolve_overlap),
+        out_csv=out_csv,
+        include_stems=include_stems,
+    )
+
+
+if __name__ == "__main__":
+    main()
