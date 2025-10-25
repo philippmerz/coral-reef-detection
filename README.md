@@ -29,18 +29,23 @@ Follow these steps to train a YOLOv12 segmentation model using the provided pipe
     ```
     in the `yolov12` directory/environment.
 
+   Note: If your OS is not Linux, remove the Linux-only wheel entry from requirements.txt before installing. Specifically, delete the line:
+   ```bash
+   flash_attn-2.7.3+cu11torch2.2cxx11abiFALSE-cp311-cp311-linux_x86_64.whl
+   ```
 
-3. **Download Pretrained Weights**  
+
+4. **Download Pretrained Weights**  
    Download the YOLOv12 segmentation model weights:
     - [yolov12m-seg.pt](https://github.com/sunsmarterjie/yolov12/releases/download/seg/yolov12m-seg.pt)
     - Place the file inside the `yolov12` directory.
 
 
-4. **Prepare the Pipeline Code**
+5. **Prepare the Pipeline Code**
     - Copy your preprocessing and training scripts (such as `image_structure.py`, `masks_to_yolo_polygons.py`, and `yoloseg_train.py`) into the `yolov12` directory.
 
     
-5. **Edit Paths in Scripts**
+6. **Edit Paths in Scripts**
     - Open each `.py` file (`image_structure.py`, `masks_to_yolo_polygons.py`, etc.) and update the dataset paths to point to your local data.  
       _For example:_  
       ```python
@@ -48,7 +53,7 @@ Follow these steps to train a YOLOv12 segmentation model using the provided pipe
       ```
 
 
-6. **Organize Images for YOLO**
+7. **Organize Images for YOLO**
     - Run the following to create the YOLO folder structure (`yolo_seg`) inside `reef_support`:
       ```bash
       python image_structure.py
@@ -56,7 +61,7 @@ Follow these steps to train a YOLOv12 segmentation model using the provided pipe
     - This will create `yolo_seg/images/train` and `yolo_seg/images/val`.
 
 
-7. **Update Dataset YAML**
+8. **Update Dataset YAML**
     - Edit `coral_seg.yaml` and set the `train` and `val` paths to your new YOLO structure.  
       _Example:_  
       ```yaml
@@ -66,7 +71,7 @@ Follow these steps to train a YOLOv12 segmentation model using the provided pipe
     - Make sure to update the `nc` (number of classes) and `names` fields if needed.
 
 
-8. **Convert Masks to YOLO Polygon Labels**
+9. **Convert Masks to YOLO Polygon Labels**
     - Run:
       ```bash
       python masks_to_yolo_polygons.py
@@ -74,7 +79,7 @@ Follow these steps to train a YOLOv12 segmentation model using the provided pipe
     - This will generate YOLO format label files in `yolo_seg/labels/train` and `yolo_seg/labels/val`.
 
 
-9. **Train the YOLOv12 Segmentation Model**
+10. **Train the YOLOv12 Segmentation Model**
     - Start training using your custom data:
       ```bash
       python yoloseg_train.py
